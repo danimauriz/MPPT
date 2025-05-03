@@ -1,0 +1,6 @@
+{
+    "files.associations": {
+        "ledc.h": "c",
+        "task.h": "c"
+    }
+}
