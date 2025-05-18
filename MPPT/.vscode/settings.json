@@ -1,6 +1,7 @@
 {
     "files.associations": {
         "ledc.h": "c",
-        "task.h": "c"
+        "task.h": "c",
+        "freertos.h": "c"
     }
 }
