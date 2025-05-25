@@ -19,7 +19,7 @@
 
 
 
-#define PWM_FREQ       2000
+#define PWM_FREQ       10000
 #define PWM_CHANNEL    LEDC_CHANNEL_0
 #define PWM_TIMER      LEDC_TIMER_0
 #define PWM_GPIO       25
@@ -198,14 +198,21 @@ static void ws_async_send(void *arg)
 static esp_err_t trigger_async_send(httpd_handle_t handle, httpd_req_t *req)
 {
     struct async_resp_arg *resp_arg = malloc(sizeof(struct async_resp_arg));
+    if (resp_arg == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
     resp_arg->hd = req->handle;
     resp_arg->fd = httpd_req_to_sockfd(req);
-    return httpd_queue_work(handle, ws_async_send, resp_arg);
+    esp_err_t ret = httpd_queue_work(handle, ws_async_send, resp_arg);
+    if (ret != ESP_OK) {
+        free(resp_arg);
+    }
+    return ret;
 }
 
 // --- Web server handler ---
 esp_err_t web_handler(httpd_req_t *req) {
-    char resp[256];
+    char resp[1024]; // Tamanio del buffer de respuesta
 
     taskENTER_CRITICAL(&data_mux);
     float c = current;
@@ -214,10 +221,29 @@ esp_err_t web_handler(httpd_req_t *req) {
     int d = duty_cycle;
     taskEXIT_CRITICAL(&data_mux);
 
+    /*
     snprintf(resp, sizeof(resp),
              "<html><body><h1>ESP32 Monitor</h1>"
              "Current_Sensor: %.2f<br>Panel_Voltage: %.2f<br>Battery_Voltage: %.2f<br>Duty Cycle: %d<br>"
              "</body></html>", c, p, b, d);
+    */
+    snprintf(resp, sizeof(resp),
+        "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>ESP32 Monitor</title></head><body>"
+        "<h1>ESP32 Monitor</h1>"
+        "<p>Current_Sensor: <span id='current'>%.2f</span></p>"
+        "<p>Panel_Voltage: <span id='panel'>%.2f</span></p>"
+        "<p>Battery_Voltage: <span id='battery'>%.2f</span></p>"
+        "<script>"
+        "var ws = new WebSocket('ws://' + location.host + '/ws');"
+        "ws.onmessage = function(event) {"
+        "  var data = JSON.parse(event.data);"
+        "  document.getElementById('current').textContent = data.current.toFixed(2);"
+        "  document.getElementById('panel').textContent = data.panel.toFixed(2);"
+        "  document.getElementById('battery').textContent = data.battery.toFixed(2);"
+        "};"
+        "</script></body></html>",
+        c, p, b  // Ahora usamos las variables para mostrar los valores iniciales
+    );
 
     httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
@@ -241,9 +267,10 @@ static esp_err_t handle_ws_req(httpd_req_t *req)
         ESP_LOGE(TAG, "httpd_ws_recv_frame failed to get frame len with %d", ret);
         return ret;
     }
-
+    ESP_LOGI(TAG, "frame len is %d", ws_pkt.len);
     if (ws_pkt.len)
     {
+        /* ws_pkt.len + 1 is for NULL termination as we are expecting a string */
         buf = calloc(1, ws_pkt.len + 1);
         if (buf == NULL)
         {
@@ -251,6 +278,7 @@ static esp_err_t handle_ws_req(httpd_req_t *req)
             return ESP_ERR_NO_MEM;
         }
         ws_pkt.payload = buf;
+        /* Set max_len = ws_pkt.len to get the frame payload */
         ret = httpd_ws_recv_frame(req, &ws_pkt, ws_pkt.len);
         if (ret != ESP_OK)
         {
@@ -270,20 +298,30 @@ static esp_err_t handle_ws_req(httpd_req_t *req)
         free(buf);
         return trigger_async_send(req->handle, req);
     }
-    return ESP_OK;
+
+    ret = httpd_ws_send_frame(req, &ws_pkt);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "httpd_ws_send_frame failed with %d", ret);
+    }
+    free(buf);
+    return ret;
 }
 
 // --- Inicia servidor web ---
 void start_webserver() {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    httpd_handle_t server = NULL;
+    //httpd_handle_t server = NULL;
+    
 
+
+    
     httpd_uri_t uri = {
         .uri = "/",
         .method = HTTP_GET,
         .handler = web_handler,
         .user_ctx = NULL
     };
+    
 
     httpd_uri_t ws = {
         .uri = "/ws",
@@ -331,6 +369,47 @@ void web_task(void *pvParameters) {
     vTaskDelete(NULL);  // Servidor ya corre, eliminar tarea
 }
 
+// --- Tarea en núcleo 1: Envío periódico por websockets ---
+void websocket_broadcast_task(void *pvParameters) {
+    //Espera a que este inicializado el webserver
+    while (server == NULL) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    while (1) {
+        httpd_ws_frame_t ws_pkt;
+        char buff[64];
+        memset(buff, 0, sizeof(buff));
+
+        taskENTER_CRITICAL(&data_mux);
+        float c = current;
+        float p = panel_voltage;
+        float b = battery_voltage;
+        taskEXIT_CRITICAL(&data_mux);
+
+        sprintf(buff, "{\"current\": %.2f, \"panel\": %.2f, \"battery\": %.2f}", c, p, b);
+
+
+        memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
+        ws_pkt.payload = (uint8_t *)buff;
+        ws_pkt.len = strlen(buff);
+        ws_pkt.type = HTTPD_WS_TYPE_TEXT;
+
+        size_t max_clients = CONFIG_LWIP_MAX_LISTENING_TCP;
+        int client_fds[max_clients];
+        size_t fds = max_clients;
+
+        if (httpd_get_client_list(server, &fds, client_fds) == ESP_OK) {
+            for (int i = 0; i < fds; i++) {
+                if (httpd_ws_get_fd_info(server, client_fds[i]) == HTTPD_WS_CLIENT_WEBSOCKET) {
+                    httpd_ws_send_frame_async(server, client_fds[i], &ws_pkt);
+                }
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1000));  // cada 1 segundo
+    }
+}
+
 // --- app_main ---
 void app_main(void) {
     nvs_flash_init(); // Necesario para WiFi
@@ -339,4 +418,5 @@ void app_main(void) {
 
     xTaskCreatePinnedToCore(sensor_task, "SensorTask", 4096, NULL, 1, NULL, 0);
     xTaskCreatePinnedToCore(web_task,    "WebTask",    4096, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(websocket_broadcast_task, "WebSocketBroadcast", 4096, NULL, 1, NULL, 1);
 }
