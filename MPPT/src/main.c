@@ -9,7 +9,6 @@
 #include "nvs_flash.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
-#include "esp_random.h"
 #include "esp_system.h"
 #include "esp_spiffs.h"
 #include "esp_adc/adc_oneshot.h"
@@ -35,14 +34,33 @@ struct async_resp_arg {
     int fd;
 };
 
+typedef struct {
+    int raw_current; 
+    float current_sense;
+} current_t;
+
+typedef struct {
+    int raw_panel_voltage; 
+    float panel_voltage_sense;
+} panel_voltage_t;
+
+typedef struct {
+    int raw_battery_voltage; 
+    float battery_voltage_sense;
+} battery_voltage_t;
+
 // Variables compartidas
 volatile float current = 0;
 volatile float panel_voltage = 0.0;
 volatile float battery_voltage = 0.0;
+volatile int adc_current = 0;
+volatile int adc_panel = 0;
+volatile int adc_battery = 0;
 int duty_cycle = 0;
 
 // Mutex para sincronización
-portMUX_TYPE data_mux = portMUX_INITIALIZER_UNLOCKED;
+//portMUX_TYPE data_mux = portMUX_INITIALIZER_UNLOCKED;
+SemaphoreHandle_t data_mutex;
 
 // --- PWM Init ---
 void init_pwm() {
@@ -81,48 +99,61 @@ void config_ADC() {
     };
 
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, ADC_CHANNEL_6, &config));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, ADC_CHANNEL_7, &config));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, ADC_CHANNEL_4, &config));
 }
 
 
-float read_current() {
-    int adc_current_sense = 0;
-    esp_err_t err = adc_oneshot_read(adc_handle, ADC_CHANNEL_6, &adc_current_sense);
+current_t read_current() {
+    current_t c_ = {0};
+    esp_err_t err = adc_oneshot_read(adc_handle, ADC_CHANNEL_6, &c_.raw_current);
     if (err != ESP_OK) {
         printf("ACD current sensor read failed: %s", esp_err_to_name(err));
     }
-    printf(" ADC_CHANNEL_6 (GPIO 34) ADC input current _sensor:   %d \n", adc_current_sense);
+    printf(" ADC_CHANNEL_6 (GPIO 34) ADC input current _sensor:   %d \n", c_.raw_current);
+    c_.current_sense = ((c_.raw_current * 3.3 / 4095.0) - 2.5) / 0.185;
+    printf(" Input panel voltage:   %.2f \n", c_.current_sense);
 
-
-
-    return (float)adc_current_sense;
+    return c_;
 }
 
-float read_panel_voltage() {
-    int adc_panel_voltage_sense = 0;
-    float voltage = 0.0;
-    esp_err_t err = adc_oneshot_read(adc_handle, ADC_CHANNEL_7, &adc_panel_voltage_sense);
-    if (err != ESP_OK) {
-        printf("ACD panel voltage read failed: %s", esp_err_to_name(err));
+panel_voltage_t read_panel_voltage() {
+    panel_voltage_t p_v = {0};
+    int acumulado = 0;
+    const int muestras = 10;
+    for(int i = 0; i < muestras; i++){
+        int lectura = 0;
+        esp_err_t err = adc_oneshot_read(adc_handle, ADC_CHANNEL_7, &lectura);
+        if (err != ESP_OK) {
+            printf("ACD panel voltage read failed: %s", esp_err_to_name(err));
+        }
+        else {
+            acumulado += lectura;
+            printf("Lectura %d: %d\n", i, lectura);
+        }
     }
-    printf(" ADC_CHANNEL_7 (GPIO 35) ADC input panel voltage:   %d \n", adc_panel_voltage_sense);
-    voltage = adc_panel_voltage_sense * 45 / 4096;
-    printf(" Input panel voltage:   %.2f \n", voltage);
+    // Calculo promedio
+    p_v.raw_panel_voltage = acumulado / muestras;
 
-    return voltage;
+
+    printf(" ADC_CHANNEL_7 (GPIO 35) ADC input panel voltage:   %d \n", p_v.raw_panel_voltage);
+    p_v.panel_voltage_sense = (p_v.raw_panel_voltage / 4095.0) * 45.0;
+    printf(" Input panel voltage:   %.2f \n", p_v.panel_voltage_sense);
+
+    return p_v;
 }
 
-float read_battery_voltage() {
-    int adc_battery_voltage_sense = 0;
-    float voltage = 0.0;
-    esp_err_t err = adc_oneshot_read(adc_handle, ADC_CHANNEL_4, &adc_battery_voltage_sense);
+battery_voltage_t read_battery_voltage() {
+    battery_voltage_t b_v = {0};
+    esp_err_t err = adc_oneshot_read(adc_handle, ADC_CHANNEL_4, &b_v.raw_battery_voltage);
     if (err != ESP_OK) {
         printf("ACD battery voltage read failed: %s", esp_err_to_name(err));
     }
-    printf(" ADC_CHANNEL_4 (GPIO 32) ADC input battery voltage:   %d \n", adc_battery_voltage_sense);
-    voltage = adc_battery_voltage_sense * 16.5 / 4096;
-    printf(" Input battery voltage:   %.2f \n", voltage);
+    printf(" ADC_CHANNEL_4 (GPIO 32) ADC input battery voltage:   %d \n", b_v.raw_battery_voltage);
+    b_v.battery_voltage_sense = (b_v.raw_battery_voltage / 4095.0) * 16.5;
+    printf(" Input battery voltage:   %.2f \n", b_v.battery_voltage_sense);
 
-    return voltage;
+    return b_v;
 }
 
 // --- Tarea en núcleo 0: Lee sensores y ajusta PWM ---
@@ -135,23 +166,23 @@ void sensor_task(void *pvParameters) {
         int duty = (int)(result * 10);
         if (duty > 1023) duty = 1023;
         */
+        current_t c = read_current();
+        panel_voltage_t pv = read_panel_voltage();
+        battery_voltage_t bv = read_battery_voltage();
         
-
-        float current_sense = read_current();
-        float panel_voltage_sense = read_panel_voltage();
-        float battery_voltage_sense = read_battery_voltage();
-
-        taskENTER_CRITICAL(&data_mux);
-        current = current_sense;
-        panel_voltage = panel_voltage_sense;
-        battery_voltage = battery_voltage_sense;
-        taskEXIT_CRITICAL(&data_mux);
+        xSemaphoreTake(data_mutex, portMAX_DELAY);
+        current = c.current_sense;
+        panel_voltage = pv.panel_voltage_sense;
+        battery_voltage = bv.battery_voltage_sense;
+        adc_current = c.raw_current;
+        adc_panel = pv.raw_panel_voltage;
+        adc_battery = bv.raw_battery_voltage;
+        xSemaphoreGive(data_mutex);
 
         int duty = 1023*0.33;
 
         printf("Duty: %i\n", duty);
 
-         
 
         ledc_set_duty(LEDC_HIGH_SPEED_MODE, PWM_CHANNEL, duty);
         ledc_update_duty(LEDC_HIGH_SPEED_MODE, PWM_CHANNEL);
@@ -212,14 +243,17 @@ static esp_err_t trigger_async_send(httpd_handle_t handle, httpd_req_t *req)
 
 // --- Web server handler ---
 esp_err_t web_handler(httpd_req_t *req) {
-    char resp[1024]; // Tamanio del buffer de respuesta
+    char resp[2048]; // Tamanio del buffer de respuesta
 
-    taskENTER_CRITICAL(&data_mux);
+    xSemaphoreTake(data_mutex, portMAX_DELAY);
     float c = current;
     float p = panel_voltage;
     float b = battery_voltage;
+    int adc_c = adc_current;
+    int adc_p = adc_panel;
+    int adc_b = adc_battery;
     int d = duty_cycle;
-    taskEXIT_CRITICAL(&data_mux);
+    xSemaphoreGive(data_mutex);
 
     /*
     snprintf(resp, sizeof(resp),
@@ -231,18 +265,25 @@ esp_err_t web_handler(httpd_req_t *req) {
         "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>ESP32 Monitor</title></head><body>"
         "<h1>ESP32 Monitor</h1>"
         "<p>Current_Sensor: <span id='current'>%.2f</span></p>"
-        "<p>Panel_Voltage: <span id='panel'>%.2f</span></p>"
-        "<p>Battery_Voltage: <span id='battery'>%.2f</span></p>"
+        "<p>RAW_Current: <span id='raw_current'>%d</span></p>"
+        "<p>Panel_Voltage: <span id='panel_voltage'>%.2f</span></p>"
+        "<p>RAW_Panel_Voltage: <span id='raw_panel_voltage'>%d</span></p>"
+        "<p>Battery_Voltage: <span id='battery_voltage'>%.2f</span></p>"
+        "<p>RAW_Battery_Voltage: <span id='raw_battery_voltage'>%d</span></p>"
         "<script>"
         "var ws = new WebSocket('ws://' + location.host + '/ws');"
         "ws.onmessage = function(event) {"
         "  var data = JSON.parse(event.data);"
         "  document.getElementById('current').textContent = data.current.toFixed(2);"
-        "  document.getElementById('panel').textContent = data.panel.toFixed(2);"
-        "  document.getElementById('battery').textContent = data.battery.toFixed(2);"
+        "  document.getElementById('raw_current').textContent = data.raw_current;"
+        "  document.getElementById('panel_voltage').textContent = data.panel.toFixed(2);"
+        "  document.getElementById('raw_panel_voltage').textContent = data.raw_panel_voltage;"
+        "  document.getElementById('battery_voltage').textContent = data.battery.toFixed(2);"
+        "  document.getElementById('raw_battery_voltage').textContent = data.raw_battery_voltage;"
+        "  console.log(data);"
         "};"
         "</script></body></html>",
-        c, p, b  // Ahora usamos las variables para mostrar los valores iniciales
+        c, adc_c, p, adc_p, b, adc_b
     );
 
     httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
@@ -310,10 +351,8 @@ static esp_err_t handle_ws_req(httpd_req_t *req)
 // --- Inicia servidor web ---
 void start_webserver() {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.stack_size = 8192;       // Se me desbordaba la pila
     //httpd_handle_t server = NULL;
-    
-
-
     
     httpd_uri_t uri = {
         .uri = "/",
@@ -377,16 +416,20 @@ void websocket_broadcast_task(void *pvParameters) {
     }
     while (1) {
         httpd_ws_frame_t ws_pkt;
-        char buff[64];
+        char buff[256];
         memset(buff, 0, sizeof(buff));
 
-        taskENTER_CRITICAL(&data_mux);
+        xSemaphoreTake(data_mutex, portMAX_DELAY);
         float c = current;
         float p = panel_voltage;
         float b = battery_voltage;
-        taskEXIT_CRITICAL(&data_mux);
+        int adc_c = adc_current;
+        int adc_p = adc_panel;
+        int adc_b = adc_battery;
+        int d = duty_cycle;
+        xSemaphoreGive(data_mutex);
 
-        sprintf(buff, "{\"current\": %.2f, \"panel\": %.2f, \"battery\": %.2f}", c, p, b);
+        sprintf(buff, "{\"current\": %.2f, \"raw_current\": %d, \"panel\": %.2f, \"raw_panel_voltage\": %d, \"battery\": %.2f, \"raw_battery_voltage\": %d}", c, adc_c, p, adc_p, b, adc_b);
 
 
         memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
@@ -415,6 +458,7 @@ void app_main(void) {
     nvs_flash_init(); // Necesario para WiFi
     init_pwm();
     config_ADC();
+    data_mutex = xSemaphoreCreateMutex();  // Inicializa el mutex
 
     xTaskCreatePinnedToCore(sensor_task, "SensorTask", 4096, NULL, 1, NULL, 0);
     xTaskCreatePinnedToCore(web_task,    "WebTask",    4096, NULL, 1, NULL, 1);
