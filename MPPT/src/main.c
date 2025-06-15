@@ -16,9 +16,23 @@
 
 #include "esp_adc/adc_cali_scheme.h"
 
+#include "driver/i2c.h"
+
+#define I2C_MASTER_SCL_IO          22
+#define I2C_MASTER_SDA_IO          21
+#define I2C_MASTER_NUM             I2C_NUM_0
+#define I2C_MASTER_FREQ_HZ         100000
+#define I2C_MASTER_TX_BUF_DISABLE  0
+#define I2C_MASTER_RX_BUF_DISABLE  0
+
+#define ADS1115_ADDR 0x48 // Address depends on ADDR pin
+#define ADS1115_REG_CONV 0x00
+#define ADS1115_REG_CONFIG 0x01
+
+#define ADS1115_FS 4.096  // o el que uses en el PGA
 
 
-#define PWM_FREQ       10000
+#define PWM_FREQ       20000
 #define PWM_CHANNEL    LEDC_CHANNEL_0
 #define PWM_TIMER      LEDC_TIMER_0
 #define PWM_GPIO       25
@@ -84,6 +98,37 @@ void init_pwm() {
     ledc_channel_config(&channel_conf);
 }
 
+void i2c_master_init() {
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_MASTER_SDA_IO,
+        .scl_io_num = I2C_MASTER_SCL_IO,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_MASTER_FREQ_HZ,
+    };
+    i2c_param_config(I2C_MASTER_NUM, &conf);
+    i2c_driver_install(I2C_MASTER_NUM, conf.mode, 
+                       I2C_MASTER_RX_BUF_DISABLE, 
+                       I2C_MASTER_TX_BUF_DISABLE, 0);
+}
+
+void ads1115_configure() {
+    uint8_t config[3];
+    config[0] = ADS1115_REG_CONFIG;
+    config[1] = 0xC2; // MSB (A0, single-shot, 128 SPS)
+    config[2] = 0x83; // LSB (disable comparator, single-shot mode)
+    i2c_master_write_to_device(I2C_MASTER_NUM, ADS1115_ADDR, config, 3, 1000 / portTICK_PERIOD_MS);
+}
+
+int16_t ads1115_read() {
+    uint8_t reg = ADS1115_REG_CONV;
+    uint8_t data[2];
+    i2c_master_write_read_device(I2C_MASTER_NUM, ADS1115_ADDR, &reg, 1, data, 2, 1000 / portTICK_PERIOD_MS);
+    return ((int16_t)data[0] << 8) | data[1];
+}
+
+/*
 void config_ADC() {
 
     adc_oneshot_unit_init_cfg_t init_config1 = {
@@ -102,7 +147,7 @@ void config_ADC() {
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, ADC_CHANNEL_7, &config));
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, ADC_CHANNEL_4, &config));
 }
-
+*/
 
 current_t read_current() {
     current_t c_ = {0};
@@ -165,7 +210,8 @@ void sensor_task(void *pvParameters) {
 
         int duty = (int)(result * 10);
         if (duty > 1023) duty = 1023;
-        */
+        
+
         current_t c = read_current();
         panel_voltage_t pv = read_panel_voltage();
         battery_voltage_t bv = read_battery_voltage();
@@ -178,11 +224,18 @@ void sensor_task(void *pvParameters) {
         adc_panel = pv.raw_panel_voltage;
         adc_battery = bv.raw_battery_voltage;
         xSemaphoreGive(data_mutex);
+        */
+        int16_t lectura = 0;
 
         int duty = 1023*0.33;
 
         printf("Duty: %i\n", duty);
+        lectura = ads1115_read();
+        printf("Lectura : %i\n", lectura);
 
+        
+        float voltage = (lectura / 32768.0) * ADS1115_FS;
+        printf("Voltaje: %.4f V\n", voltage);
 
         ledc_set_duty(LEDC_HIGH_SPEED_MODE, PWM_CHANNEL, duty);
         ledc_update_duty(LEDC_HIGH_SPEED_MODE, PWM_CHANNEL);
@@ -457,7 +510,9 @@ void websocket_broadcast_task(void *pvParameters) {
 void app_main(void) {
     nvs_flash_init(); // Necesario para WiFi
     init_pwm();
-    config_ADC();
+    i2c_master_init();
+    ads1115_configure();
+    //config_ADC();
     data_mutex = xSemaphoreCreateMutex();  // Inicializa el mutex
 
     xTaskCreatePinnedToCore(sensor_task, "SensorTask", 4096, NULL, 1, NULL, 0);
